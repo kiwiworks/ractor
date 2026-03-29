@@ -358,10 +358,10 @@ async fn handle_child_exit(
             restart_child(myself, state, idx).await?;
         }
         SupervisionStrategy::OneForAll => {
-            todo!("OneForAll restart strategy")
+            restart_all(myself, state).await?;
         }
         SupervisionStrategy::RestForOne => {
-            todo!("RestForOne restart strategy")
+            restart_rest(myself, state, idx).await?;
         }
     }
 
@@ -397,6 +397,87 @@ async fn restart_child(
             Err(Box::new(err))
         }
     }
+}
+
+/// Stop all children in reverse order, then restart all in forward order.
+async fn restart_all(
+    myself: ActorRef<SupervisorMessage>,
+    state: &mut SupervisorState,
+) -> Result<(), ActorProcessingErr> {
+    let sup_cell = myself.get_cell();
+
+    // Stop all live children in reverse order
+    for entry in state.children.iter_mut().rev() {
+        if let Some(cell) = entry.cell.take() {
+            let timeout = entry.spec.shutdown_timeout;
+            if cell.stop_and_wait(None, Some(timeout)).await.is_err() {
+                cell.kill();
+            }
+        }
+    }
+
+    // Restart all in forward order
+    for entry in &mut state.children {
+        let starter = Arc::clone(&entry.starter);
+        let spec = entry.spec.clone();
+        match starter(sup_cell.clone()).await {
+            Ok(new_cell) => {
+                new_cell.link_with_spec(sup_cell.clone(), spec);
+                entry.cell = Some(new_cell);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to restart child in one_for_all");
+                entry.cell = None;
+                return Err(Box::new(err));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Stop children started after the failed child (in reverse order),
+/// then restart them (including the failed child) in forward order.
+async fn restart_rest(
+    myself: ActorRef<SupervisorMessage>,
+    state: &mut SupervisorState,
+    failed_idx: usize,
+) -> Result<(), ActorProcessingErr> {
+    let sup_cell = myself.get_cell();
+
+    // Stop children from last down to failed_idx (reverse order)
+    for i in (failed_idx..state.children.len()).rev() {
+        if let Some(cell) = state.children[i].cell.take() {
+            let timeout = state.children[i].spec.shutdown_timeout;
+            if cell.stop_and_wait(None, Some(timeout)).await.is_err() {
+                cell.kill();
+            }
+        }
+    }
+
+    // Restart from failed_idx forward
+    for i in failed_idx..state.children.len() {
+        let entry = &mut state.children[i];
+        let starter = Arc::clone(&entry.starter);
+        let spec = entry.spec.clone();
+        match starter(sup_cell.clone()).await {
+            Ok(new_cell) => {
+                new_cell.link_with_spec(sup_cell.clone(), spec);
+                entry.cell = Some(new_cell);
+            }
+            Err(err) => {
+                tracing::error!(
+                    child_idx = i,
+                    error = %err,
+                    "failed to restart child in rest_for_one"
+                );
+                entry.cell = None;
+                return Err(Box::new(err));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ─── Builder ─────────────────────────────────────────────────────────────────
@@ -687,5 +768,119 @@ mod tests {
         );
 
         let _ = sup_handle.await;
+    }
+
+    #[crate::concurrency::test]
+    async fn test_one_for_all_restarts_all_children() {
+        let count_a = Arc::new(AtomicU32::new(0));
+        let count_b = Arc::new(AtomicU32::new(0));
+        let ref_slot_a: Arc<Mutex<Option<ActorRef<()>>>> = Arc::new(Mutex::new(None));
+        let ref_slot_b: Arc<Mutex<Option<ActorRef<()>>>> = Arc::new(Mutex::new(None));
+
+        let (sup_ref, sup_handle) = Supervisor::builder()
+            .strategy(SupervisionStrategy::OneForAll)
+            .restart_intensity(RestartIntensity {
+                max_restarts: 5,
+                period: Duration::from_secs(10),
+            })
+            .child(
+                ChildSpec::default(),
+                make_child_starter(Arc::clone(&count_a), Arc::clone(&ref_slot_a)),
+            )
+            .child(
+                ChildSpec::default(),
+                make_child_starter(Arc::clone(&count_b), Arc::clone(&ref_slot_b)),
+            )
+            .spawn(None)
+            .await
+            .expect("supervisor should start");
+
+        crate::concurrency::sleep(Duration::from_millis(100)).await;
+        assert_eq!(1, count_a.load(Ordering::SeqCst));
+        assert_eq!(1, count_b.load(Ordering::SeqCst));
+
+        // Crash child A — both should restart
+        {
+            let slot = ref_slot_a.lock().unwrap();
+            slot.as_ref().unwrap().cast(()).expect("send failed");
+        }
+
+        crate::concurrency::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            2,
+            count_a.load(Ordering::SeqCst),
+            "child A should have restarted"
+        );
+        assert_eq!(
+            2,
+            count_b.load(Ordering::SeqCst),
+            "child B should also have restarted"
+        );
+
+        sup_ref.stop(None);
+        sup_handle.await.unwrap();
+    }
+
+    #[crate::concurrency::test]
+    async fn test_rest_for_one_restarts_subsequent_children() {
+        let count_a = Arc::new(AtomicU32::new(0));
+        let count_b = Arc::new(AtomicU32::new(0));
+        let count_c = Arc::new(AtomicU32::new(0));
+        let ref_slot_a: Arc<Mutex<Option<ActorRef<()>>>> = Arc::new(Mutex::new(None));
+        let ref_slot_b: Arc<Mutex<Option<ActorRef<()>>>> = Arc::new(Mutex::new(None));
+        let ref_slot_c: Arc<Mutex<Option<ActorRef<()>>>> = Arc::new(Mutex::new(None));
+
+        let (sup_ref, sup_handle) = Supervisor::builder()
+            .strategy(SupervisionStrategy::RestForOne)
+            .restart_intensity(RestartIntensity {
+                max_restarts: 5,
+                period: Duration::from_secs(10),
+            })
+            .child(
+                ChildSpec::default(),
+                make_child_starter(Arc::clone(&count_a), Arc::clone(&ref_slot_a)),
+            )
+            .child(
+                ChildSpec::default(),
+                make_child_starter(Arc::clone(&count_b), Arc::clone(&ref_slot_b)),
+            )
+            .child(
+                ChildSpec::default(),
+                make_child_starter(Arc::clone(&count_c), Arc::clone(&ref_slot_c)),
+            )
+            .spawn(None)
+            .await
+            .expect("supervisor should start");
+
+        crate::concurrency::sleep(Duration::from_millis(100)).await;
+        assert_eq!(1, count_a.load(Ordering::SeqCst));
+        assert_eq!(1, count_b.load(Ordering::SeqCst));
+        assert_eq!(1, count_c.load(Ordering::SeqCst));
+
+        // Crash child B — B and C should restart, A should NOT
+        {
+            let slot = ref_slot_b.lock().unwrap();
+            slot.as_ref().unwrap().cast(()).expect("send failed");
+        }
+
+        crate::concurrency::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            1,
+            count_a.load(Ordering::SeqCst),
+            "child A should NOT have restarted"
+        );
+        assert_eq!(
+            2,
+            count_b.load(Ordering::SeqCst),
+            "child B should have restarted"
+        );
+        assert_eq!(
+            2,
+            count_c.load(Ordering::SeqCst),
+            "child C should have restarted"
+        );
+
+        sup_ref.stop(None);
+        sup_handle.await.unwrap();
     }
 }
