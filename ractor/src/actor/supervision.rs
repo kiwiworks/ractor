@@ -21,39 +21,82 @@ use super::actor_cell::ActorCell;
 use super::messages::SupervisionEvent;
 use crate::ActorId;
 
+/// How a supervisor should respond when a child exits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum RestartPolicy {
+    /// Always restart the child (OTP `permanent`).
+    #[default]
+    Permanent,
+    /// Restart only on abnormal exit — crash or error, not clean stop (OTP `transient`).
+    Transient,
+    /// Never restart (OTP `temporary`).
+    Temporary,
+}
+
+/// Per-child configuration in a supervision tree.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ChildSpec {
+    /// Maximum time to wait for graceful stop before killing.
+    pub shutdown_timeout: crate::concurrency::Duration,
+    /// When to restart this child after exit.
+    pub restart_policy: RestartPolicy,
+}
+
+impl Default for ChildSpec {
+    fn default() -> Self {
+        Self {
+            shutdown_timeout: crate::concurrency::Duration::from_secs(5),
+            restart_policy: RestartPolicy::default(),
+        }
+    }
+}
+
 /// A supervision tree
 ///
 /// Children are stored in insertion order ([`IndexMap`]) so that shutdown
 /// can proceed in reverse start order, matching OTP supervisor semantics.
 #[derive(Default, Debug)]
 pub(crate) struct SupervisionTree {
-    children: Mutex<Option<IndexMap<ActorId, ActorCell>>>,
+    children: Mutex<Option<IndexMap<ActorId, (ActorCell, ChildSpec)>>>,
     supervisor: Mutex<Option<ActorCell>>,
     #[cfg(feature = "monitors")]
     monitors: Mutex<Option<HashMap<ActorId, ActorCell>>>,
 }
 
 impl SupervisionTree {
-    /// Push a child into the tree (preserves insertion order for ordered shutdown)
+    /// Push a child into the tree with default spec (preserves insertion order)
     pub(crate) fn insert_child(&self, child: ActorCell) {
+        self.insert_child_with_spec(child, ChildSpec::default());
+    }
+
+    /// Push a child into the tree with an explicit [`ChildSpec`]
+    pub(crate) fn insert_child_with_spec(&self, child: ActorCell, spec: ChildSpec) {
         let mut guard = self.children.lock().unwrap();
         if let Some(map) = &mut *(guard) {
-            map.insert(child.get_id(), child);
+            map.insert(child.get_id(), (child, spec));
         } else {
-            *guard = Some(IndexMap::from_iter([(child.get_id(), child)]));
+            *guard = Some(IndexMap::from_iter([(child.get_id(), (child, spec))]));
         }
     }
 
     /// Remove a specific actor from the supervision tree (e.g. actor died).
-    /// Uses `swap_remove` for O(1) removal — order of remaining live children
-    /// relative to each other is preserved except the last element moves to
-    /// the removed position. This is acceptable because removal happens when
-    /// a child dies, and dead children don't participate in shutdown ordering.
+    /// Uses `swap_remove` for O(1) removal.
     pub(crate) fn remove_child(&self, child: ActorId) {
         let mut guard = self.children.lock().unwrap();
         if let Some(map) = &mut *(guard) {
             map.swap_remove(&child);
         }
+    }
+
+    /// Retrieve the [`ChildSpec`] for a specific child, if it exists.
+    #[allow(dead_code)]
+    pub(crate) fn get_child_spec(&self, child: ActorId) -> Option<ChildSpec> {
+        let guard = self.children.lock().unwrap();
+        guard
+            .as_ref()
+            .and_then(|map| map.get(&child).map(|(_, spec)| spec.clone()))
     }
 
     /// Push a parent into the tere
@@ -99,28 +142,27 @@ impl SupervisionTree {
     /// Sends `stop` to each child and waits up to `timeout` for them to exit.
     /// Any child still alive after the timeout is forcefully killed.
     /// Clears the children map and unlinks all children from this supervisor.
-    pub(crate) async fn graceful_shutdown_all_children(
-        &self,
-        timeout: crate::concurrency::Duration,
-    ) {
-        // Collect children in reverse insertion order and clear the map under
-        // the lock. Release before any async work to keep the future Send.
-        let cells: Vec<ActorCell> = {
+    pub(crate) async fn graceful_shutdown_all_children(&self) {
+        // Collect children with their specs in reverse insertion order and clear
+        // the map under the lock. Release before any async work to keep the
+        // future Send.
+        let entries: Vec<(ActorCell, ChildSpec)> = {
             let mut guard = self.children.lock().unwrap();
-            let cells = if let Some(map) = &mut *guard {
+            let entries = if let Some(map) = &mut *guard {
                 // Reverse: shut down last-started child first (OTP semantics)
                 map.values().rev().cloned().collect()
             } else {
                 vec![]
             };
             *guard = None;
-            cells
+            entries
         };
 
-        // Sequentially stop each child in reverse start order, waiting for
-        // each to exit before proceeding to the next. Kill on timeout.
-        for cell in &cells {
-            if cell.stop_and_wait(None, Some(timeout)).await.is_err() {
+        // Sequentially stop each child in reverse start order, using per-child
+        // shutdown timeout from its ChildSpec. Kill on timeout.
+        for (cell, spec) in &entries {
+            let child_timeout = spec.shutdown_timeout;
+            if cell.stop_and_wait(None, Some(child_timeout)).await.is_err() {
                 cell.kill();
             }
             if cell.get_status() != super::actor_cell::ActorStatus::Stopped {
@@ -134,15 +176,16 @@ impl SupervisionTree {
     /// from the supervision tree since the supervisor is shutting down
     /// and can't deal with superivison events anyways
     pub(crate) fn terminate_all_children(&self) {
-        let mut guard = self.children.lock().unwrap();
-        let cells = if let Some(map) = &mut *guard {
-            map.values().cloned().collect()
-        } else {
-            vec![]
+        let cells: Vec<ActorCell> = {
+            let mut guard = self.children.lock().unwrap();
+            let cells = if let Some(map) = &mut *guard {
+                map.values().map(|(cell, _)| cell.clone()).collect()
+            } else {
+                vec![]
+            };
+            *guard = None;
+            cells
         };
-        *guard = None;
-        // drop the guard to not deadlock on double-link
-        drop(guard);
         for cell in cells {
             cell.terminate();
             cell.clear_supervisor();
@@ -243,25 +286,24 @@ impl SupervisionTree {
         }
     }
 
-    /// Return all linked children
+    /// Return all linked children (cells only, no specs)
     pub(crate) fn get_children(&self) -> Vec<ActorCell> {
         let guard = self.children.lock().unwrap();
         if let Some(map) = &*guard {
-            map.values().cloned().collect()
+            map.values().map(|(cell, _)| cell.clone()).collect()
         } else {
             vec![]
         }
     }
 
     /// Execute a closure for each child without allocating a Vec.
-    /// This is more efficient when you just need to iterate over children.
     pub(crate) fn for_each_child<F>(&self, mut f: F)
     where
         F: FnMut(&ActorCell),
     {
         let guard = self.children.lock().unwrap();
         if let Some(map) = &*guard {
-            for cell in map.values() {
+            for (cell, _) in map.values() {
                 f(cell);
             }
         }

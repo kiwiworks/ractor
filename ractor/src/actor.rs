@@ -69,7 +69,8 @@ pub mod actor_id;
 pub(crate) mod actor_properties;
 pub mod actor_ref;
 pub mod derived_actor;
-mod supervision;
+pub(crate) mod supervision;
+pub use supervision::{ChildSpec, RestartPolicy};
 
 #[cfg(test)]
 mod supervision_tests;
@@ -770,10 +771,8 @@ where
                 },
             };
 
-            // gracefully shut down children (stop + wait with timeout, then kill survivors)
-            myself
-                .graceful_terminate(ActorCell::DEFAULT_SHUTDOWN_TIMEOUT)
-                .await;
+            // gracefully shut down children (stop + wait per-child timeout, then kill survivors)
+            myself.graceful_terminate().await;
 
             // notify supervisors of the actor's death
             myself.notify_supervisor_and_monitors(evt);

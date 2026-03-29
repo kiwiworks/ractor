@@ -348,10 +348,8 @@ impl<TActor: ThreadLocalActor> ThreadLocalActorRuntime<TActor> {
                         },
                     };
 
-                    // gracefully shut down children (stop + wait with timeout, then kill survivors)
-                    myself
-                        .graceful_terminate(ActorCell::DEFAULT_SHUTDOWN_TIMEOUT)
-                        .await;
+                    // gracefully shut down children (stop + wait per-child timeout, then kill survivors)
+                    myself.graceful_terminate().await;
 
                     // notify supervisors of the actor's death
                     myself.notify_supervisor_and_monitors(evt);

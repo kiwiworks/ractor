@@ -202,6 +202,8 @@ pub use actor::messages::Signal;
 pub use actor::messages::SupervisionEvent;
 pub use actor::Actor;
 pub use actor::ActorRuntime;
+pub use actor::ChildSpec;
+pub use actor::RestartPolicy;
 #[cfg(feature = "async-trait")]
 pub use async_trait::async_trait;
 #[cfg(test)]

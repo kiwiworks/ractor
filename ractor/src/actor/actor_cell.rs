@@ -379,29 +379,38 @@ impl ActorCell {
         self.inner.tree.terminate_all_children();
     }
 
-    /// Gracefully terminate this actor and shut down children with a timeout.
+    /// Gracefully terminate this actor and shut down children.
     ///
     /// Stops self (if still active), then sends graceful stop to all children
-    /// and waits up to `timeout` for them to exit. Any child still alive after
-    /// the timeout is forcefully killed.
-    pub(crate) async fn graceful_terminate(&self, timeout: crate::concurrency::Duration) {
+    /// using each child's [`ChildSpec::shutdown_timeout`]. Any child still alive
+    /// after its timeout is forcefully killed. Children are stopped in reverse
+    /// start order (OTP semantics).
+    pub(crate) async fn graceful_terminate(&self) {
         // we don't need to notify of exit if we're already stopping or stopped
         if self.get_status() as u8 <= ActorStatus::Upgrading as u8 {
             self.kill();
         }
 
-        // gracefully shut down children with timeout, then kill survivors
-        self.inner
-            .tree
-            .graceful_shutdown_all_children(timeout)
-            .await;
+        // gracefully shut down children with per-child timeouts, then kill survivors
+        self.inner.tree.graceful_shutdown_all_children().await;
     }
 
-    /// Link this [super::Actor] to the provided supervisor
+    /// Link this [super::Actor] to the provided supervisor with default [`ChildSpec`].
     ///
     /// * `supervisor` - The supervisor [super::Actor] of this actor
     pub fn link(&self, supervisor: ActorCell) {
         supervisor.inner.tree.insert_child(self.clone());
+        self.inner.tree.set_supervisor(supervisor);
+    }
+
+    /// Link this [super::Actor] to the provided supervisor with an explicit [`ChildSpec`].
+    ///
+    /// The spec controls shutdown timeout and restart policy for this child.
+    pub fn link_with_spec(&self, supervisor: ActorCell, spec: super::supervision::ChildSpec) {
+        supervisor
+            .inner
+            .tree
+            .insert_child_with_spec(self.clone(), spec);
         self.inner.tree.set_supervisor(supervisor);
     }
 
