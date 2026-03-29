@@ -1198,7 +1198,7 @@ async fn test_supervisor_double_link() {
 )]
 // Ignored on wasm32-unknown-unknown, since panic can't be catched on this platform
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-async fn test_supervisor_exit_doesnt_call_child_post_stop() {
+async fn test_supervisor_exit_calls_child_post_stop() {
     struct Child {
         post_stop_calls: Arc<AtomicU8>,
     }
@@ -1276,8 +1276,8 @@ async fn test_supervisor_exit_doesnt_call_child_post_stop() {
     s_handle.await.unwrap();
     c_handle.await.unwrap();
 
-    // Child's post-stop should NOT have been called.
-    assert_eq!(0, flag.load(Ordering::SeqCst));
+    // Child's post-stop SHOULD have been called (graceful shutdown with timeout).
+    assert_eq!(1, flag.load(Ordering::SeqCst));
 }
 
 #[crate::concurrency::test]

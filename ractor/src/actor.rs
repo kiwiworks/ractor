@@ -770,8 +770,10 @@ where
                 },
             };
 
-            // terminate children
-            myself.terminate();
+            // gracefully shut down children (stop + wait with timeout, then kill survivors)
+            myself
+                .graceful_terminate(ActorCell::DEFAULT_SHUTDOWN_TIMEOUT)
+                .await;
 
             // notify supervisors of the actor's death
             myself.notify_supervisor_and_monitors(evt);

@@ -361,7 +361,11 @@ impl ActorCell {
         self.inner.set_status(status)
     }
 
-    /// Terminate this [super::Actor] and all it's children
+    /// Default timeout for graceful child shutdown (5 seconds, matching OTP defaults).
+    pub const DEFAULT_SHUTDOWN_TIMEOUT: crate::concurrency::Duration =
+        crate::concurrency::Duration::from_secs(5);
+
+    /// Terminate this [super::Actor] and all it's children (forceful — sends Kill)
     pub(crate) fn terminate(&self) {
         // we don't need to notify of exit if we're already stopping or stopped
         if self.get_status() as u8 <= ActorStatus::Upgrading as u8 {
@@ -373,6 +377,24 @@ impl ActorCell {
 
         // notify children they should die. They will unlink themselves from the supervisor
         self.inner.tree.terminate_all_children();
+    }
+
+    /// Gracefully terminate this actor and shut down children with a timeout.
+    ///
+    /// Stops self (if still active), then sends graceful stop to all children
+    /// and waits up to `timeout` for them to exit. Any child still alive after
+    /// the timeout is forcefully killed.
+    pub(crate) async fn graceful_terminate(&self, timeout: crate::concurrency::Duration) {
+        // we don't need to notify of exit if we're already stopping or stopped
+        if self.get_status() as u8 <= ActorStatus::Upgrading as u8 {
+            self.kill();
+        }
+
+        // gracefully shut down children with timeout, then kill survivors
+        self.inner
+            .tree
+            .graceful_shutdown_all_children(timeout)
+            .await;
     }
 
     /// Link this [super::Actor] to the provided supervisor

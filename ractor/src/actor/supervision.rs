@@ -84,6 +84,46 @@ impl SupervisionTree {
         }
     }
 
+    /// Gracefully shut down all children with a timeout, then kill any survivors.
+    ///
+    /// Sends `stop` to each child and waits up to `timeout` for them to exit.
+    /// Any child still alive after the timeout is forcefully killed.
+    /// Clears the children map and unlinks all children from this supervisor.
+    pub(crate) async fn graceful_shutdown_all_children(
+        &self,
+        timeout: crate::concurrency::Duration,
+    ) {
+        // Collect children and clear the map under the lock, then release
+        // before any async work to keep the future Send.
+        let cells: Vec<ActorCell> = {
+            let mut guard = self.children.lock().unwrap();
+            let cells = if let Some(map) = &mut *guard {
+                map.values().cloned().collect()
+            } else {
+                vec![]
+            };
+            *guard = None;
+            cells
+        };
+
+        // Phase 1: send graceful stop to all children concurrently and wait
+        let mut js = crate::concurrency::JoinSet::new();
+        for cell in &cells {
+            let c = cell.clone();
+            let t = timeout;
+            js.spawn(async move { c.stop_and_wait(None, Some(t)).await });
+        }
+        while let Some(_res) = js.join_next().await {}
+
+        // Phase 2: kill any survivors (stop_and_wait may have timed out)
+        for cell in &cells {
+            if cell.get_status() != super::actor_cell::ActorStatus::Stopped {
+                cell.kill();
+            }
+            cell.clear_supervisor();
+        }
+    }
+
     /// Terminate all your supervised children and unlink them
     /// from the supervision tree since the supervisor is shutting down
     /// and can't deal with superivison events anyways
