@@ -200,6 +200,7 @@ pub use actor::actor_ref::ActorRef;
 pub use actor::derived_actor::DerivedActorRef;
 pub use actor::messages::Signal;
 pub use actor::messages::SupervisionEvent;
+pub use actor::supervisor::{RestartIntensity, SupervisionStrategy, Supervisor};
 pub use actor::Actor;
 pub use actor::ActorRuntime;
 pub use actor::ChildSpec;

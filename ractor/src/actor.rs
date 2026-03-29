@@ -70,6 +70,7 @@ pub(crate) mod actor_properties;
 pub mod actor_ref;
 pub mod derived_actor;
 pub(crate) mod supervision;
+pub mod supervisor;
 pub use supervision::{ChildSpec, RestartPolicy};
 
 #[cfg(test)]
