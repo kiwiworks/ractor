@@ -720,6 +720,7 @@ where
         self.discard_settings.update_worker_limit(discard_limit);
         self.stats.worker_ping_received(&self.factory_name, time);
         self.is_ping_pending = false;
+        self.last_ping = Instant::now();
     }
 
     /// Called when the factory is notified a worker completed a job. Will push the next message
