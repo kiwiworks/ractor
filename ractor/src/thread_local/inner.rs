@@ -423,8 +423,15 @@ impl<TActor: ThreadLocalActor> ThreadLocalActorRuntime<TActor> {
 
         let (exit_state, exit_reason, was_killed) = loop_done??;
 
-        // if we didn't exit in error mode, call `post_stop`
-        if !was_killed {
+        if was_killed {
+            // Best-effort post_stop with timeout — don't let a killed actor hang forever.
+            // Errors are ignored since we're already dying.
+            let _ = crate::concurrency::timeout(
+                ActorCell::DEFAULT_SHUTDOWN_TIMEOUT,
+                Self::do_post_stop(myself_clone, handler, exit_state),
+            )
+            .await;
+        } else {
             Self::do_post_stop(myself_clone, handler, exit_state)
                 .await?
                 .map_err(ActorErr::Failed)?;
