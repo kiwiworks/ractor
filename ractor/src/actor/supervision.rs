@@ -11,38 +11,48 @@
 //! how to handle the event. Should it restart the actor, leave it dead, potentially die itself
 //! notifying the supervisor's supervisor? That's up to the implementation of the [super::Actor]
 
+#[cfg(feature = "monitors")]
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+use indexmap::IndexMap;
 
 use super::actor_cell::ActorCell;
 use super::messages::SupervisionEvent;
 use crate::ActorId;
 
 /// A supervision tree
+///
+/// Children are stored in insertion order ([`IndexMap`]) so that shutdown
+/// can proceed in reverse start order, matching OTP supervisor semantics.
 #[derive(Default, Debug)]
 pub(crate) struct SupervisionTree {
-    children: Mutex<Option<HashMap<ActorId, ActorCell>>>,
+    children: Mutex<Option<IndexMap<ActorId, ActorCell>>>,
     supervisor: Mutex<Option<ActorCell>>,
     #[cfg(feature = "monitors")]
     monitors: Mutex<Option<HashMap<ActorId, ActorCell>>>,
 }
 
 impl SupervisionTree {
-    /// Push a child into the tere
+    /// Push a child into the tree (preserves insertion order for ordered shutdown)
     pub(crate) fn insert_child(&self, child: ActorCell) {
         let mut guard = self.children.lock().unwrap();
         if let Some(map) = &mut *(guard) {
             map.insert(child.get_id(), child);
         } else {
-            *guard = Some(HashMap::from_iter([(child.get_id(), child)]));
+            *guard = Some(IndexMap::from_iter([(child.get_id(), child)]));
         }
     }
 
-    /// Remove a specific actor from the supervision tree (e.g. actor died)
+    /// Remove a specific actor from the supervision tree (e.g. actor died).
+    /// Uses `swap_remove` for O(1) removal — order of remaining live children
+    /// relative to each other is preserved except the last element moves to
+    /// the removed position. This is acceptable because removal happens when
+    /// a child dies, and dead children don't participate in shutdown ordering.
     pub(crate) fn remove_child(&self, child: ActorId) {
         let mut guard = self.children.lock().unwrap();
         if let Some(map) = &mut *(guard) {
-            map.remove(&child);
+            map.swap_remove(&child);
         }
     }
 
@@ -93,12 +103,13 @@ impl SupervisionTree {
         &self,
         timeout: crate::concurrency::Duration,
     ) {
-        // Collect children and clear the map under the lock, then release
-        // before any async work to keep the future Send.
+        // Collect children in reverse insertion order and clear the map under
+        // the lock. Release before any async work to keep the future Send.
         let cells: Vec<ActorCell> = {
             let mut guard = self.children.lock().unwrap();
             let cells = if let Some(map) = &mut *guard {
-                map.values().cloned().collect()
+                // Reverse: shut down last-started child first (OTP semantics)
+                map.values().rev().cloned().collect()
             } else {
                 vec![]
             };
@@ -106,17 +117,12 @@ impl SupervisionTree {
             cells
         };
 
-        // Phase 1: send graceful stop to all children concurrently and wait
-        let mut js = crate::concurrency::JoinSet::new();
+        // Sequentially stop each child in reverse start order, waiting for
+        // each to exit before proceeding to the next. Kill on timeout.
         for cell in &cells {
-            let c = cell.clone();
-            let t = timeout;
-            js.spawn(async move { c.stop_and_wait(None, Some(t)).await });
-        }
-        while let Some(_res) = js.join_next().await {}
-
-        // Phase 2: kill any survivors (stop_and_wait may have timed out)
-        for cell in &cells {
+            if cell.stop_and_wait(None, Some(timeout)).await.is_err() {
+                cell.kill();
+            }
             if cell.get_status() != super::actor_cell::ActorStatus::Stopped {
                 cell.kill();
             }
